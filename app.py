@@ -1,3 +1,15 @@
+import sys
+import subprocess
+
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    import pyrebase
+except ImportError:
+    install("pyrebase4==4.5.0")
+    install("google-cloud-storage>=2.0.0")
+    import pyrebase
 import streamlit as st
 import boto3
 import pandas as pd
