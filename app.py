@@ -1,15 +1,3 @@
-import sys
-import subprocess
-
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-try:
-    import pyrebase
-except ImportError:
-    install("pyrebase4==4.5.0")
-    install("google-cloud-storage>=2.0.0")
-    import pyrebase
 import streamlit as st
 import boto3
 import pandas as pd
@@ -18,57 +6,92 @@ import time
 import requests
 import json
 import os
+import sys
+import subprocess
 from datetime import datetime, timedelta
-from pytz import timezone
-import pyrebase
 from io import StringIO
+from google.cloud import storage
+from google.oauth2 import service_account
 
 # App Configuration
 st.set_page_config(page_title="Email Marketing Suite", layout="wide")
 
 # Initialize session state variables
-if 'ses_client' not in st.session_state:
-    st.session_state.ses_client = None
-if 'firebase' not in st.session_state:
-    st.session_state.firebase = None
-if 'firebase_initialized' not in st.session_state:
-    st.session_state.firebase_initialized = False
-if 'selected_journal' not in st.session_state:
-    st.session_state.selected_journal = None
+def init_session_state():
+    if 'ses_client' not in st.session_state:
+        st.session_state.ses_client = None
+    if 'firebase_storage' not in st.session_state:
+        st.session_state.firebase_storage = None
+    if 'firebase_initialized' not in st.session_state:
+        st.session_state.firebase_initialized = False
+    if 'selected_journal' not in st.session_state:
+        st.session_state.selected_journal = None
 
-# Firebase Configuration (replace with your actual config)
-firebase_config = {
-    "apiKey": "your-api-key",
-    "authDomain": "your-project.firebaseapp.com",
-    "databaseURL": "https://your-project.firebaseio.com",
-    "projectId": "your-project",
-    "storageBucket": "your-project.appspot.com",
-    "messagingSenderId": "your-sender-id",
-    "appId": "your-app-id"
-}
+init_session_state()
 
-# Initialize Firebase
+# Load configuration from secrets
+@st.cache_data
+def load_config():
+    config = {
+        'aws': {
+            'access_key': st.secrets.get("aws.ACCESS_KEY_ID", ""),
+            'secret_key': st.secrets.get("aws.SECRET_ACCESS_KEY", ""),
+            'region': 'us-east-1'
+        },
+        'millionverifier': {
+            'api_key': st.secrets.get("millionverifier.API_KEY", "")
+        },
+        'firebase': {
+            'type': st.secrets.get("firebase.type", ""),
+            'project_id': st.secrets.get("firebase.project_id", ""),
+            'private_key_id': st.secrets.get("firebase.private_key_id", ""),
+            'private_key': st.secrets.get("firebase.private_key", "").replace('\\n', '\n'),
+            'client_email': st.secrets.get("firebase.client_email", ""),
+            'client_id': st.secrets.get("firebase.client_id", ""),
+            'auth_uri': st.secrets.get("firebase.auth_uri", ""),
+            'token_uri': st.secrets.get("firebase.token_uri", ""),
+            'auth_provider_x509_cert_url': st.secrets.get("firebase.auth_provider_x509_cert_url", ""),
+            'client_x509_cert_url': st.secrets.get("firebase.client_x509_cert_url", "")
+        }
+    }
+    return config
+
+config = load_config()
+
+# Initialize Firebase Storage
 def initialize_firebase():
     try:
-        firebase = pyrebase.initialize_app(firebase_config)
-        auth = firebase.auth()
-        # You can sign in anonymously or with email/password
-        user = auth.sign_in_anonymous()
-        st.session_state.firebase = firebase
+        creds_dict = {
+            "type": config['firebase']['type'],
+            "project_id": config['firebase']['project_id'],
+            "private_key_id": config['firebase']['private_key_id'],
+            "private_key": config['firebase']['private_key'],
+            "client_email": config['firebase']['client_email'],
+            "client_id": config['firebase']['client_id'],
+            "auth_uri": config['firebase']['auth_uri'],
+            "token_uri": config['firebase']['token_uri'],
+            "auth_provider_x509_cert_url": config['firebase']['auth_provider_x509_cert_url'],
+            "client_x509_cert_url": config['firebase']['client_x509_cert_url']
+        }
+        
+        credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        storage_client = storage.Client(credentials=credentials)
+        
+        st.session_state.firebase_storage = storage_client
         st.session_state.firebase_initialized = True
-        return firebase
+        return storage_client
     except Exception as e:
         st.error(f"Firebase initialization failed: {str(e)}")
         return None
 
 # Initialize SES Client
-def initialize_ses(aws_access_key, aws_secret_key, region='us-east-1'):
+def initialize_ses():
     try:
         ses_client = boto3.client(
             'ses',
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key,
-            region_name=region
+            aws_access_key_id=config['aws']['access_key'],
+            aws_secret_access_key=config['aws']['secret_key'],
+            region_name=config['aws']['region']
         )
         st.session_state.ses_client = ses_client
         return ses_client
@@ -103,7 +126,7 @@ JOURNALS = [
     "Universal Journal of Mathematics and Mathematical Sciences"
 ]
 
-# Default email templates for each journal
+# Default email templates
 def get_journal_template(journal_name):
     templates = {
         "default": """Dear $$Author_Name$$,
@@ -127,51 +150,48 @@ $$Journal_Name$$
 
 [Unsubscribe: $$Unsubscribe_Link$$]"""
     }
-    
     return templates.get(journal_name, templates['default'])
 
-# Function to upload file to Firebase Storage
+# Firebase Storage Functions
 def upload_to_firebase(file, file_name, folder="email_lists"):
     if not st.session_state.firebase_initialized:
         initialize_firebase()
     
     try:
-        storage = st.session_state.firebase.storage()
-        path = f"{folder}/{file_name}"
-        storage.child(path).put(file)
+        bucket = st.session_state.firebase_storage.bucket()
+        blob = bucket.blob(f"{folder}/{file_name}")
+        blob.upload_from_string(file.getvalue(), content_type='text/csv')
         return True
     except Exception as e:
         st.error(f"Failed to upload file: {str(e)}")
         return False
 
-# Function to download file from Firebase Storage
 def download_from_firebase(file_name, folder="email_lists"):
     if not st.session_state.firebase_initialized:
         initialize_firebase()
     
     try:
-        storage = st.session_state.firebase.storage()
-        path = f"{folder}/{file_name}"
-        url = storage.child(path).get_url(None)
-        return url
+        bucket = st.session_state.firebase_storage.bucket()
+        blob = bucket.blob(f"{folder}/{file_name}")
+        content = blob.download_as_text()
+        return content
     except Exception as e:
         st.error(f"Failed to download file: {str(e)}")
         return None
 
-# Function to list files in Firebase Storage
 def list_firebase_files(folder="email_lists"):
     if not st.session_state.firebase_initialized:
         initialize_firebase()
     
     try:
-        storage = st.session_state.firebase.storage()
-        files = storage.child(folder).list_files()
-        return [file.name.split('/')[-1] for file in files]
+        bucket = st.session_state.firebase_storage.bucket()
+        blobs = bucket.list_blobs(prefix=folder)
+        return [blob.name.split('/')[-1] for blob in blobs if not blob.name.endswith('/')]
     except Exception as e:
         st.error(f"Failed to list files: {str(e)}")
         return []
 
-# Function to send email via SES
+# Email Functions
 def send_ses_email(ses_client, sender, recipient, subject, body_html, body_text, unsubscribe_link):
     try:
         response = ses_client.send_email(
@@ -205,7 +225,7 @@ def send_ses_email(ses_client, sender, recipient, subject, body_html, body_text,
         st.error(f"Failed to send email: {str(e)}")
         return None
 
-# Function to verify email with MillionVerifier
+# Verification Functions
 def verify_email(email, api_key):
     url = f"https://api.millionverifier.com/api/v3/?api={api_key}&email={email}"
     try:
@@ -216,12 +236,10 @@ def verify_email(email, api_key):
         st.error(f"Verification failed: {str(e)}")
         return None
 
-# Function to process email list with MillionVerifier
 def process_email_list(file, api_key):
     try:
-        # Read the file
         if isinstance(file, str):
-            df = pd.read_csv(file)
+            df = pd.read_csv(StringIO(file))
         else:
             df = pd.read_csv(file)
         
@@ -239,12 +257,11 @@ def process_email_list(file, api_key):
         st.error(f"Failed to process email list: {str(e)}")
         return None
 
-# Dashboard for email analytics
+# Analytics Functions
 def show_email_analytics(ses_client):
     st.subheader("Email Campaign Analytics")
     
     try:
-        # Get send statistics
         stats = ses_client.get_send_statistics()
         datapoints = stats['SendDataPoints']
         
@@ -252,12 +269,10 @@ def show_email_analytics(ses_client):
             st.info("No email statistics available yet.")
             return
         
-        # Convert to DataFrame
         df = pd.DataFrame(datapoints)
         df['Timestamp'] = pd.to_datetime(df['Timestamp'])
         df.set_index('Timestamp', inplace=True)
         
-        # Display metrics
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Delivery Attempts", df['DeliveryAttempts'].sum())
@@ -266,10 +281,8 @@ def show_email_analytics(ses_client):
         with col3:
             st.metric("Complaints", df['Complaints'].sum())
         
-        # Display time series chart
         st.line_chart(df[['DeliveryAttempts', 'Bounces', 'Complaints']])
         
-        # Display bounce reasons (if any)
         bounce_response = ses_client.list_bounces()
         if bounce_response['Bounces']:
             st.subheader("Bounce Details")
@@ -283,25 +296,18 @@ def show_email_analytics(ses_client):
 def main():
     st.title("Academic Email Marketing Suite")
     
+    # Initialize services
+    if not st.session_state.ses_client:
+        initialize_ses()
+    
+    if not st.session_state.firebase_initialized:
+        initialize_firebase()
+    
     # Navigation
     tab1, tab2 = st.tabs(["Advertisements", "Email Spam Filtration"])
     
     with tab1:
         st.header("Journal Advertisement Campaigns")
-        
-        # SES Configuration
-        with st.expander("Amazon SES Configuration", expanded=False):
-            aws_access_key = st.text_input("AWS Access Key ID", type="password")
-            aws_secret_key = st.text_input("AWS Secret Access Key", type="password")
-            region = st.selectbox("AWS Region", ["us-east-1", "us-west-2", "eu-west-1"])
-            
-            if st.button("Initialize SES"):
-                if aws_access_key and aws_secret_key:
-                    ses_client = initialize_ses(aws_access_key, aws_secret_key, region)
-                    if ses_client:
-                        st.success("SES client initialized successfully!")
-                else:
-                    st.error("Please provide both AWS Access Key and Secret Key")
         
         # Journal Selection
         col1, col2 = st.columns([3, 1])
@@ -324,20 +330,17 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             email_subject = st.text_input("Email Subject", 
-                                         f"Call for Papers - {st.session_state.selected_journal}")
+                                       f"Call for Papers - {st.session_state.selected_journal}")
         
         email_body = st.text_area("Email Body", template, height=300)
         
-        # Template variables help
-        st.info("""
-        Available template variables:
+        st.info("""Available template variables:
         - $$Author_Name$$: Author's full name
         - $$Department$$: Author's department
         - $$University$$: Author's university
         - $$Country$$: Author's country
         - $$Journal_Name$$: Selected journal name
-        - $$Unsubscribe_Link$$: Unsubscribe link
-        """)
+        - $$Unsubscribe_Link$$: Unsubscribe link""")
         
         # File Upload
         st.subheader("Recipient List")
@@ -349,12 +352,10 @@ def main():
                 df = pd.read_csv(uploaded_file)
                 st.dataframe(df.head())
                 
-                # Option to save to Firebase
                 if st.button("Save to Firebase"):
                     if upload_to_firebase(uploaded_file, uploaded_file.name):
                         st.success("File uploaded to Firebase successfully!")
         else:
-            # List files from Firebase
             if st.button("Refresh File List"):
                 st.session_state.firebase_files = list_firebase_files()
             
@@ -362,9 +363,9 @@ def main():
                 selected_file = st.selectbox("Select file from Firebase", st.session_state.firebase_files)
                 
                 if st.button("Load File"):
-                    file_url = download_from_firebase(selected_file)
-                    if file_url:
-                        df = pd.read_csv(file_url)
+                    file_content = download_from_firebase(selected_file)
+                    if file_content:
+                        df = pd.read_csv(StringIO(file_content))
                         st.session_state.current_recipient_list = df
                         st.dataframe(df.head())
             else:
@@ -395,7 +396,6 @@ def main():
                 status_text = st.empty()
                 
                 for i, row in df.iterrows():
-                    # Replace template variables
                     email_content = email_body
                     email_content = email_content.replace("$$Author_Name$$", str(row.get('Author Name', '')))
                     email_content = email_content.replace("$$Department$$", str(row.get('Department', '')))
@@ -406,44 +406,25 @@ def main():
                     unsubscribe_link = f"{unsubscribe_base_url}{row.get('email', '')}"
                     email_content = email_content.replace("$$Unsubscribe_Link$$", unsubscribe_link)
                     
-                    # Send email
                     response = send_ses_email(
                         st.session_state.ses_client,
                         sender_email,
                         row.get('email', ''),
                         email_subject,
-                        email_content.replace("\n", "<br>"),  # Simple HTML conversion
+                        email_content.replace("\n", "<br>"),
                         email_content,
                         unsubscribe_link
                     )
                     
-                    # Update progress
                     progress = (i + 1) / total_emails
                     progress_bar.progress(progress)
                     status_text.text(f"Processing {i+1} of {total_emails}: {row.get('email', '')}")
                 
                 st.success(f"Campaign completed! {total_emails} emails sent.")
-                
-                # Show analytics
                 show_email_analytics(st.session_state.ses_client)
     
     with tab2:
         st.header("Email Spam Filtration")
-        
-        # MillionVerifier Configuration
-        with st.expander("MillionVerifier Configuration", expanded=False):
-            mv_api_key = st.text_input("MillionVerifier API Key", type="password")
-            
-            if st.button("Test API Connection"):
-                if mv_api_key:
-                    test_email = "test@example.com"
-                    result = verify_email(test_email, mv_api_key)
-                    if result:
-                        st.success(f"API Connection Successful! Response: {result.get('result', 'Unknown')}")
-                    else:
-                        st.error("API Connection Failed")
-                else:
-                    st.error("Please provide API Key")
         
         # File Upload for Verification
         st.subheader("Email List Verification")
@@ -456,17 +437,16 @@ def main():
                 st.dataframe(df.head())
                 
                 if st.button("Verify Emails"):
-                    if not mv_api_key:
+                    if not config['millionverifier']['api_key']:
                         st.error("Please configure MillionVerifier API Key first")
                         return
                     
                     with st.spinner("Verifying emails..."):
-                        result_df = process_email_list(uploaded_file, mv_api_key)
+                        result_df = process_email_list(uploaded_file, config['millionverifier']['api_key'])
                         if result_df is not None:
                             st.session_state.verified_emails = result_df
                             st.dataframe(result_df)
                             
-                            # Save verified file
                             csv = result_df.to_csv(index=False)
                             verified_filename = f"verified_{uploaded_file.name}"
                             st.download_button(
@@ -476,12 +456,10 @@ def main():
                                 "text/csv"
                             )
                             
-                            # Option to save to Firebase
                             if st.button("Save Verified List to Firebase"):
-                                if upload_to_firebase(csv, verified_filename):
+                                if upload_to_firebase(StringIO(csv), verified_filename):
                                     st.success("Verified file uploaded to Firebase!")
         else:
-            # List files from Firebase
             if st.button("Refresh File List for Verification"):
                 st.session_state.firebase_files_verification = list_firebase_files()
             
@@ -490,24 +468,23 @@ def main():
                                            st.session_state.firebase_files_verification)
                 
                 if st.button("Load File for Verification"):
-                    file_url = download_from_firebase(selected_file)
-                    if file_url:
-                        df = pd.read_csv(file_url)
+                    file_content = download_from_firebase(selected_file)
+                    if file_content:
+                        df = pd.read_csv(StringIO(file_content))
                         st.session_state.current_verification_list = df
                         st.dataframe(df.head())
                         
                         if st.button("Start Verification"):
-                            if not mv_api_key:
+                            if not config['millionverifier']['api_key']:
                                 st.error("Please configure MillionVerifier API Key first")
                                 return
                             
                             with st.spinner("Verifying emails..."):
-                                result_df = process_email_list(file_url, mv_api_key)
+                                result_df = process_email_list(file_content, config['millionverifier']['api_key'])
                                 if result_df is not None:
                                     st.session_state.verified_emails = result_df
                                     st.dataframe(result_df)
                                     
-                                    # Save verified file
                                     csv = result_df.to_csv(index=False)
                                     verified_filename = f"verified_{selected_file}"
                                     st.download_button(
@@ -517,9 +494,8 @@ def main():
                                         "text/csv"
                                     )
                                     
-                                    # Option to save to Firebase
                                     if st.button("Save Verified List to Firebase"):
-                                        if upload_to_firebase(csv, verified_filename):
+                                        if upload_to_firebase(StringIO(csv), verified_filename):
                                             st.success("Verified file uploaded to Firebase!")
             else:
                 st.info("No files found in Firebase Storage")
@@ -539,7 +515,6 @@ def main():
                 invalid = len(df[df['verification_result'] == 'invalid'])
                 st.metric("Invalid Emails", invalid)
             
-            # Pie chart of results
             result_counts = df['verification_result'].value_counts()
             st.bar_chart(result_counts)
 
